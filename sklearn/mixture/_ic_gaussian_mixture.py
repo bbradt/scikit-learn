@@ -1,10 +1,13 @@
-"""Gaussian Mixture Model."""
+"""Information-Constrained Gaussian Mixture Model."""
 
 # Author: Wei Xue <xuewei4d@gmail.com>
 # Modified by Thierry Guillemot <thierry.guillemot.work@gmail.com>
+# Modified by Brad Baker <bbradt@gatech.edu>
 # License: BSD 3 clause
 
 import numpy as np
+
+from npeet import entropy_estimators as ee
 
 from scipy import linalg
 
@@ -139,7 +142,7 @@ def _check_precisions(precisions, covariance_type, n_components, n_features):
 ###############################################################################
 # Gaussian mixture parameters estimators (used by the M-Step)
 
-def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
+def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar, lambdas):
     """Estimate the full covariance matrices.
 
     Parameters
@@ -161,14 +164,19 @@ def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
     """
     n_components, n_features = means.shape
     covariances = np.empty((n_components, n_features, n_features))
+    entropies = np.zeros((n_components,))
+    lambcoef = 0
     for k in range(n_components):
         diff = X - means[k]
         covariances[k] = np.dot(resp[:, k] * diff.T, diff) / nk[k]
         covariances[k].flat[::n_features + 1] += reg_covar
-    return covariances
+        #entropies[k] = np.log(2*np.pi*np.exp*np.norm(covariances[k], 1))
+        entropies[k] = 1/np.linalg.norm(covariances[k], 1)
+        lambcoef += lambdas[k]*entropies[k]
+    return covariances + lambcoef
 
 
-def _estimate_gaussian_covariances_tied(resp, X, nk, means, reg_covar):
+def _estimate_gaussian_covariances_tied(resp, X, nk, means, reg_covar, lambdas):
     """Estimate the tied covariance matrix.
 
     Parameters
@@ -188,15 +196,18 @@ def _estimate_gaussian_covariances_tied(resp, X, nk, means, reg_covar):
     covariance : array, shape (n_features, n_features)
         The tied covariance matrix of the components.
     """
+    lambcoef = np.sum(lambdas * reg_covar)
     avg_X2 = np.dot(X.T, X)
     avg_means2 = np.dot(nk * means.T, means)
     covariance = avg_X2 - avg_means2
     covariance /= nk.sum()
     covariance.flat[::len(covariance) + 1] += reg_covar
-    return covariance
+    #entropy = np.log(2*np.pi*np.exp*np.linalg.norm(covariance, 1))
+    entropy = 1/np.linalg.norm(covariance, 1)
+    return covariance + np.sum(lambdas)*entropy
 
 
-def _estimate_gaussian_covariances_diag(resp, X, nk, means, reg_covar):
+def _estimate_gaussian_covariances_diag(resp, X, nk, means, reg_covar, lambdas):
     """Estimate the diagonal covariance vectors.
 
     Parameters
@@ -219,10 +230,13 @@ def _estimate_gaussian_covariances_diag(resp, X, nk, means, reg_covar):
     avg_X2 = np.dot(resp.T, X * X) / nk[:, np.newaxis]
     avg_means2 = means ** 2
     avg_X_means = means * np.dot(resp.T, X) / nk[:, np.newaxis]
-    return avg_X2 - 2 * avg_X_means + avg_means2 + reg_covar
+    covariance = avg_X2 - 2 * avg_X_means + avg_means2 + reg_covar
+    #entropy = np.log(2*np.pi*np.exp*np.linalg.norm(covariance, 1))
+    entropy = 1/np.linalg.norm(covariance, 1)
+    return covariance + np.sum(lambdas)*entropy
 
 
-def _estimate_gaussian_covariances_spherical(resp, X, nk, means, reg_covar):
+def _estimate_gaussian_covariances_spherical(resp, X, nk, means, reg_covar, lambdas):
     """Estimate the spherical variance values.
 
     Parameters
@@ -243,10 +257,9 @@ def _estimate_gaussian_covariances_spherical(resp, X, nk, means, reg_covar):
         The variance values of each components.
     """
     return _estimate_gaussian_covariances_diag(resp, X, nk,
-                                               means, reg_covar).mean(1)
+                                               means, reg_covar, lambdas).mean(1)
 
-
-def _estimate_gaussian_parameters(X, resp, reg_covar, covariance_type):
+def _estimate_gaussian_parameters(X, resp, reg_covar, covariance_type, lambdas):
     """Estimate the Gaussian distribution parameters.
 
     Parameters
@@ -281,8 +294,8 @@ def _estimate_gaussian_parameters(X, resp, reg_covar, covariance_type):
                    "tied": _estimate_gaussian_covariances_tied,
                    "diag": _estimate_gaussian_covariances_diag,
                    "spherical": _estimate_gaussian_covariances_spherical
-                   }[covariance_type](resp, X, nk, means, reg_covar)
-    return nk, means, covariances
+                   }[covariance_type](resp, X, nk, means, reg_covar, lambdas)
+    return nk, means, covariances, lambdas
 
 
 def _compute_precision_cholesky(covariances, covariance_type):
@@ -431,7 +444,7 @@ def _estimate_log_gaussian_prob(X, means, precisions_chol, covariance_type):
     return -.5 * (n_features * np.log(2 * np.pi) + log_prob) + log_det
 
 
-class GaussianMixture(BaseMixture):
+class ICGaussianMixture(BaseMixture):
     """Gaussian Mixture.
 
     Representation of a Gaussian mixture model probability distribution.
@@ -591,13 +604,14 @@ class GaussianMixture(BaseMixture):
                  reg_covar=1e-6, max_iter=100, n_init=1, init_params='kmeans',
                  weights_init=None, means_init=None, precisions_init=None,
                  random_state=None, warm_start=False,
-                 verbose=0, verbose_interval=10):
+                 verbose=0, verbose_interval=10, lambda_init=None):
         super().__init__(
             n_components=n_components, tol=tol, reg_covar=reg_covar,
             max_iter=max_iter, n_init=n_init, init_params=init_params,
             random_state=random_state, warm_start=warm_start,
             verbose=verbose, verbose_interval=verbose_interval)
 
+        self.lambdas_ = lambda_init
         self.covariance_type = covariance_type
         self.weights_init = weights_init
         self.means_init = means_init
@@ -637,15 +651,20 @@ class GaussianMixture(BaseMixture):
         """
         n_samples, _ = X.shape
 
-        weights, means, covariances = _estimate_gaussian_parameters(
-            X, resp, self.reg_covar, self.covariance_type)
-        print("W: %s, M:%s, S:%s" % (str(weights.shape), str(means.shape),
-                                     str(covariances.shape)))
+        if self.lambdas_ is None:
+            first_lambdas_ = np.ones((1,self.n_components))
+        else:
+            first_lambdas_ = self.lambdas_
+
+        weights, means, covariances, lambdas_ = _estimate_gaussian_parameters(
+            X, resp, self.reg_covar, self.covariance_type, first_lambdas_)
         weights /= n_samples
 
         self.weights_ = (weights if self.weights_init is None
                          else self.weights_init)
         self.means_ = means if self.means_init is None else self.means_init
+        self.lambdas_ = lambdas_ if self.lambdas_ is None else self.lambdas_
+
 
         if self.precisions_init is None:
             self.covariances_ = covariances
@@ -673,9 +692,9 @@ class GaussianMixture(BaseMixture):
             the point of each sample in X.
         """
         n_samples, _ = X.shape
-        self.weights_, self.means_, self.covariances_ = (
+        self.weights_, self.means_, self.covariances_, self.lambdas_ = (
             _estimate_gaussian_parameters(X, np.exp(log_resp), self.reg_covar,
-                                          self.covariance_type))
+                                          self.covariance_type, self.lambdas_))
         self.weights_ /= n_samples
         self.precisions_cholesky_ = _compute_precision_cholesky(
             self.covariances_, self.covariance_type)
